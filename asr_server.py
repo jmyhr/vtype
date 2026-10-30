@@ -3,15 +3,25 @@
 
 Nemotron 3.5 ASR handles most languages; Swedish is routed to KBLab's KB-Whisper,
 which is far more accurate on Swedish. Models load once onto the GPU and serve
-transcriptions over a Unix socket.
+transcriptions over a Unix socket, and optionally over HTTP (--http) so vtype on
+other machines can use it as a remote backend.
 
-Protocol (one request per connection):
+Unix socket protocol (one request per connection):
   client -> server: a JSON header line, then the raw audio bytes
       {"lang": "en-US", "rate": 16000, "nbytes": 12345}\n<int16 mono PCM>
   server -> client: a JSON line
       {"text": "...", "seconds": 0.21}   or   {"error": "..."}
+
+HTTP (--http HOST:PORT): OpenAI-compatible POST /v1/audio/transcriptions,
+multipart form with `file` (16-bit PCM WAV) and optional `language`; `model` is
+ignored. Answers {"text": "..."}. With --api-key (or $VTYPE_API_KEY) requests
+must send `Authorization: Bearer <key>`.
 """
 import argparse
+import email.parser
+import email.policy
+import hmac
+import io
 import json
 import os
 import socket
@@ -19,6 +29,7 @@ import sys
 import threading
 import time
 import wave
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import numpy as np
 import torch
@@ -113,20 +124,24 @@ def save_recording(pcm, rate, lang, backend, text):
         os.unlink(os.path.join(RECORDINGS, old))
 
 
+def run(router, pcm, rate, lang):
+    audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+    t0 = time.time()
+    backend, text = router.transcribe(audio, rate, lang)
+    dt = time.time() - t0
+    peak = float(np.abs(audio).max()) if len(audio) else 0.0
+    log(f"{len(audio) / rate:.1f}s audio (peak {peak:.3f}) {lang}/{backend} -> {dt:.2f}s: {text!r}")
+    save_recording(pcm, rate, lang, backend, text)
+    return text, dt
+
+
 def handle(conn, router):
     with conn:
         try:
             f = conn.makefile("rb")
             header = json.loads(f.readline())
             pcm = f.read(header["nbytes"])
-            rate, lang = header.get("rate", RATE), header.get("lang")
-            audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-            t0 = time.time()
-            backend, text = router.transcribe(audio, rate, lang)
-            dt = time.time() - t0
-            peak = float(np.abs(audio).max()) if len(audio) else 0.0
-            log(f"{len(audio) / rate:.1f}s audio (peak {peak:.3f}) {lang}/{backend} -> {dt:.2f}s: {text!r}")
-            save_recording(pcm, rate, lang, backend, text)
+            text, dt = run(router, pcm, header.get("rate", RATE), header.get("lang"))
             resp = {"text": text, "seconds": dt}
         except Exception as e:  # report errors to the client instead of dying
             log(f"error: {e!r}")
@@ -134,10 +149,71 @@ def handle(conn, router):
         conn.sendall((json.dumps(resp) + "\n").encode())
 
 
+def read_wav(data):
+    with wave.open(io.BytesIO(data)) as w:
+        if w.getsampwidth() != 2:
+            raise ValueError("only 16-bit PCM WAV is supported")
+        rate, channels, pcm = w.getframerate(), w.getnchannels(), w.readframes(w.getnframes())
+    if channels > 1:
+        pcm = np.frombuffer(pcm, dtype=np.int16).reshape(-1, channels).mean(axis=1).astype(np.int16).tobytes()
+    return pcm, rate
+
+
+def http_handler(router, api_key):
+    class Handler(BaseHTTPRequestHandler):
+        def reply(self, code, obj):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            if not self.path.split("?")[0].rstrip("/").endswith("/audio/transcriptions"):
+                return self.reply(404, {"error": "not found"})
+            if api_key and not hmac.compare_digest(self.headers.get("Authorization", ""), f"Bearer {api_key}"):
+                return self.reply(401, {"error": "invalid API key"})
+            try:
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
+                    f"Content-Type: {self.headers.get('Content-Type', '')}\r\n\r\n".encode() + body)
+                fields = {part.get_param("name", header="content-disposition"): part.get_payload(decode=True)
+                          for part in msg.iter_parts()}
+                pcm, rate = read_wav(fields["file"])
+            except Exception as e:
+                return self.reply(400, {"error": f"bad request: {e!r}"})
+            try:
+                text, _ = run(router, pcm, rate, (fields.get("language") or b"auto").decode())
+            except Exception as e:
+                log(f"error: {e!r}")
+                return self.reply(500, {"error": repr(e)})
+            self.reply(200, {"text": text})
+
+        def log_message(self, fmt, *args):
+            log(f"http {self.address_string()} {fmt % args}")
+
+    return Handler
+
+
+def serve_http(addr, router, api_key):
+    host, _, port = addr.rpartition(":")
+    host = host or "127.0.0.1"
+    srv = ThreadingHTTPServer((host, int(port)), http_handler(router, api_key))
+    if host not in ("127.0.0.1", "localhost", "::1") and not api_key:
+        log("warning: HTTP is reachable from the network without an API key (set --api-key)")
+    log(f"listening on http://{host}:{port}/v1/audio/transcriptions")
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--socket", default=DEFAULT_SOCKET)
     ap.add_argument("--warmup", action="store_true", help="load models and run a dummy transcription at startup")
+    ap.add_argument("--http", metavar="[HOST:]PORT",
+                    help="also serve an OpenAI-compatible HTTP API, e.g. 0.0.0.0:8000 (default host 127.0.0.1)")
+    ap.add_argument("--api-key", default=os.environ.get("VTYPE_API_KEY"),
+                    help="require this Bearer token on HTTP requests (default $VTYPE_API_KEY)")
     args = ap.parse_args()
 
     router = Router()
@@ -154,6 +230,8 @@ def main():
     os.chmod(args.socket, 0o600)
     srv.listen(8)
     log(f"listening on {args.socket}")
+    if args.http:
+        serve_http(args.http, router, args.api_key)
     try:
         while True:
             conn, _ = srv.accept()

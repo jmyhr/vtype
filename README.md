@@ -1,14 +1,17 @@
 # vtype
 
 Push-to-talk dictation for [Claude Code](https://claude.com/claude-code) (or any terminal program),
-running **fully locally** on your GPU. Built for WSL2 on Windows.
+running **fully locally** on your GPU, or against a speech model served at an **external URL**.
+Built for WSL2 on Windows.
 
 Press **F9**, speak, press **F9** again, and the transcribed text is typed into Claude's prompt.
 
 - **English and 40 other languages:** [NVIDIA Nemotron 3.5 ASR](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) (0.6B)
 - **Swedish:** [KBLab KB-Whisper large](https://huggingface.co/KBLab/kb-whisper-large), trained on Swedish speech by the National Library of Sweden
+- **Remote backend:** use any OpenAI-compatible `/v1/audio/transcriptions` server instead, including
+  `asr_server.py` itself running on another machine
 - Recording indicator in Claude Code's status line
-- No audio leaves your machine
+- With the local backend, no audio leaves your machine
 
 ```
  ● REC  sv-SE          ← Claude Code status line while recording
@@ -22,6 +25,10 @@ Press **F9**, speak, press **F9** again, and the transcribed text is typed into 
                                        │                         └─ KB-Whisper large  (sv-*)
                                        ▼
                             types text into Claude Code
+
+ or, with backend = "remote":
+
+ vtype ──(HTTPS, OpenAI-compatible /v1/audio/transcriptions)──► external server
 ```
 
 - **`vtype`** runs your command (default `claude`) inside a pseudo-terminal and passes all keystrokes
@@ -30,17 +37,22 @@ Press **F9**, speak, press **F9** again, and the transcribed text is typed into 
   It uses only the Python standard library: audio is captured from WSLg's PulseAudio server through
   `libpulse-simple` via `ctypes`, so no PortAudio or other system packages are needed.
 - **`asr_server.py`** loads the models once and serves transcriptions over
-  `~/.cache/vtype/asr.sock`. It's started automatically by the first `vtype` and shared by all
-  sessions. It's a plain Python server on Hugging Face Transformers + PyTorch.
+  `~/.cache/vtype/asr.sock`. With the local backend it's started automatically by the first `vtype`
+  and shared by all sessions. It's a plain Python server on Hugging Face Transformers + PyTorch.
+  With `--http` it also serves an OpenAI-compatible HTTP API, so it can be the remote backend for
+  other machines.
 - **`statusline.sh`** is a Claude Code status line command that shows vtype's state.
 
 ## Requirements
 
 - Windows 11 with WSL2 and WSLg (default on current WSL; provides the microphone to Linux)
-- NVIDIA GPU with CUDA support in WSL. Both models use about 5 GB of VRAM; English only is about 1.5 GB.
+- For the local backend: NVIDIA GPU with CUDA support in WSL. Both models use about 5 GB of VRAM; English only is about 1.5 GB.
   It runs on CPU too, just slower.
 - Python 3.11+ and `libpulse0` (present on standard Ubuntu WSL images)
 - About 5 GB of disk for the models (downloaded on first run to `~/.cache/huggingface`)
+
+With the remote backend, the GPU, the models and `requirements.txt` aren't needed on the client:
+`vtype` itself uses only the Python standard library.
 
 ## Installation
 
@@ -52,6 +64,21 @@ python3 -m venv .venv
 ln -s "$PWD/vtype" ~/.local/bin/vtype     # any directory on your PATH
 ```
 
+Choose where the model runs:
+
+```bash
+vtype --configure
+```
+
+```
+Where is the speech recognition model served?
+  1) local   on this machine (asr_server.py, started automatically)
+  2) remote  an external URL with an OpenAI-compatible /v1/audio/transcriptions endpoint
+```
+
+For a remote server you're asked for its URL, an optional API key and the model name. Without a
+config file, vtype runs locally. See [Configuration](#configuration) for all settings.
+
 Check that the microphone reaches WSL:
 
 ```bash
@@ -59,7 +86,7 @@ vtype --test-mic
 ```
 
 Speak during the 3 seconds. You should see a peak level above roughly 5% and your words in the
-transcript. The first run takes a minute while the models download and load.
+transcript. With the local backend, the first run takes a minute while the models download and load.
 
 ### Status line indicator (optional)
 
@@ -114,13 +141,67 @@ The same state is also written to the terminal tab title.
 | `--key` | `f9` | Record key: `f5`–`f12` or `ctrl-space` |
 | `--lang-key` | `f10` | Language cycle key |
 | `--submit` | off | Press Enter after inserting text |
-| `--test-mic` | | Record 3 s, print the level and transcript, exit |
+| `--backend` | `local` | `local` or `remote` |
+| `--url` | | Remote server URL; implies `--backend remote` |
+| `--model` | `whisper-1` | Model name sent to the remote server |
+| `--test-mic` | | Record 3 s, print the backend, level and transcript, exit |
+| `--configure` | | Choose local or remote interactively and write the config file |
 
-Set `VTYPE_LANG=sv-SE` in your shell profile to make Swedish the default.
+## Configuration
 
-## The server
+Settings live in `~/.config/vtype/config.toml` (or `$XDG_CONFIG_HOME/vtype/config.toml`), written by
+`vtype --configure` or by hand. Command-line options override environment variables, which override
+the file.
 
-`vtype` starts the server automatically if it isn't running. To manage it yourself:
+```toml
+backend = "remote"        # "local" or "remote"
+lang = "sv-SE"            # default language
+key = "f9"                # record key
+lang_key = "f10"          # language cycle key
+submit = false            # press Enter after inserting text
+
+[remote]                  # used when backend = "remote"
+url = "https://asr.example.com/v1"
+api_key = "..."           # optional, sent as "Authorization: Bearer ..."
+model = "whisper-1"       # whatever the server calls its model
+```
+
+| Setting | Environment variable |
+|---------|----------------------|
+| `backend` | `VTYPE_BACKEND` |
+| `lang` | `VTYPE_LANG` |
+| `remote.url` | `VTYPE_URL` |
+| `remote.api_key` | `VTYPE_API_KEY` |
+| `remote.model` | `VTYPE_MODEL` |
+
+The file is created readable only by you, since it may hold an API key. Switching back to
+`backend = "local"` keeps the `[remote]` section, so you can change between them freely.
+
+### Remote servers
+
+The remote backend sends a 16 kHz mono WAV to `<url>/audio/transcriptions` as a multipart form with
+`file`, `model` and `language` (`sv-SE` is sent as `sv`; `auto` sends no language), and reads `text`
+from the JSON reply. That's the OpenAI transcription API, which many servers implement: vLLM,
+speaches (faster-whisper), whisper.cpp's server, OpenAI and Groq. The URL may be the server root
+(`http://host:8000`), the API base (`https://host/v1`) or the full endpoint.
+
+The server decides which model is used, so the per-language routing to KB-Whisper only applies
+when the remote server is `asr_server.py`.
+
+To serve vtype's own models (Nemotron + KB-Whisper) from a GPU machine:
+
+```bash
+VTYPE_API_KEY=some-long-secret .venv/bin/python asr_server.py --warmup --http 0.0.0.0:8000
+```
+
+and on the client set `url = "http://gpu-host:8000/v1"` and the same `api_key`. The server speaks
+plain HTTP; put it behind a TLS reverse proxy, a VPN such as Tailscale, or an SSH tunnel
+(`ssh -L 8000:localhost:8000 gpu-host`, then use `http://localhost:8000/v1`) when it crosses an
+untrusted network. Without `--http`'s host part it binds only to `127.0.0.1`.
+
+## The local server
+
+With the local backend, `vtype` starts the server automatically if it isn't running. To manage it yourself:
 
 ```bash
 .venv/bin/python asr_server.py --warmup     # run in the foreground
@@ -143,8 +224,15 @@ turn on *Microphone access*, *Let apps access your microphone*, and
 Settings → System → Sound. Then run `wsl --shutdown` in PowerShell (this closes all WSL windows)
 and reopen your terminal.
 
+**Agent doesn't show up in herdr.** herdr identifies agents by the pane's foreground process, which
+is vtype. vtype handles this by restarting itself with `HERDR_AGENT=<command>` when it runs in a
+herdr pane, so herdr knows `claude` is inside. Sessions started before this change need restarting.
+
 **F9 does nothing.** Make sure Claude was started with `vtype`, not `claude`. Some terminals bind
 F-keys; pick another with `--key`.
+
+**`⚠ vtype: remote ASR not reachable` / `HTTP 401`.** Check `url` and `api_key` in
+`~/.config/vtype/config.toml`, and run `vtype --test-mic` to see the full error.
 
 **`⚠ vtype: ASR server not reachable`.** Look at `~/.cache/vtype/server.log`. The first start
 downloads several GB, which can exceed the 3-minute wait; run `vtype --test-mic` again afterwards.

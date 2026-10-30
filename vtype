@@ -2,11 +2,16 @@
 """vtype - push-to-talk dictation for any terminal program (built for Claude Code).
 
     vtype [--lang sv-SE] [--key f9] [--submit] [-- ] claude [args...]
+    vtype --configure
 
 Runs the command in a pseudo-terminal. Press the hotkey (default F9) to start
 recording from the microphone; press it again to stop. The audio goes to the
-local Nemotron ASR server and the text is typed into the program's input.
-F10 cycles the language. Recording state is shown in the terminal tab title.
+ASR backend and the text is typed into the program's input. F10 cycles the
+language. Recording state is shown in the terminal tab title.
+
+The backend is chosen in ~/.config/vtype/config.toml (see --configure):
+  local   asr_server.py on this machine, over a Unix socket (started automatically)
+  remote  an external URL serving an OpenAI-compatible /v1/audio/transcriptions
 
 Stdlib only: audio is captured from WSLg's PulseAudio server via libpulse-simple.
 """
@@ -14,6 +19,8 @@ import argparse
 import array
 import ctypes
 import fcntl
+import getpass
+import io
 import json
 import os
 import pty
@@ -26,11 +33,17 @@ import sys
 import termios
 import threading
 import time
+import tomllib
 import tty
+import urllib.error
+import urllib.request
+import uuid
+import wave
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 SOCKET = os.path.expanduser("~/.cache/vtype/asr.sock")
 SERVER_LOG = os.path.expanduser("~/.cache/vtype/server.log")
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "vtype", "config.toml")
 RATE = 16000
 
 KEYS = {
@@ -98,36 +111,157 @@ class Recorder:
             self.lib.pa_simple_free(s)
 
 
-# ---------------------------------------------------------------- ASR client
+# ---------------------------------------------------------------- ASR backends
 
-def ensure_server():
-    if os.path.exists(SOCKET):
-        return
-    os.makedirs(os.path.dirname(SOCKET), exist_ok=True)
-    py = os.path.join(HERE, ".venv", "bin", "python")
-    with open(SERVER_LOG, "ab") as logf:
-        subprocess.Popen([py, os.path.join(HERE, "asr_server.py"), "--warmup"],
-                         stdin=subprocess.DEVNULL, stdout=logf, stderr=logf, start_new_session=True)
+class LocalBackend:
+    """asr_server.py on this machine, over a Unix socket."""
+    name = "local"
+
+    def prepare(self):
+        if os.path.exists(SOCKET):
+            return
+        os.makedirs(os.path.dirname(SOCKET), exist_ok=True)
+        py = os.path.join(HERE, ".venv", "bin", "python")
+        with open(SERVER_LOG, "ab") as logf:
+            subprocess.Popen([py, os.path.join(HERE, "asr_server.py"), "--warmup"],
+                             stdin=subprocess.DEVNULL, stdout=logf, stderr=logf, start_new_session=True)
+
+    def transcribe(self, pcm, lang, timeout=180):
+        deadline = time.time() + timeout
+        while True:
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.connect(SOCKET)
+                break
+            except (FileNotFoundError, ConnectionRefusedError):
+                s.close()
+                if time.time() > deadline:
+                    raise RuntimeError("ASR server not reachable, see " + SERVER_LOG)
+                time.sleep(0.5)
+        with s:
+            s.sendall((json.dumps({"lang": lang, "rate": RATE, "nbytes": len(pcm)}) + "\n").encode() + pcm)
+            resp = json.loads(s.makefile("rb").readline())
+        if "error" in resp:
+            raise RuntimeError(resp["error"])
+        return resp["text"]
 
 
-def transcribe(pcm, lang, timeout=180):
-    deadline = time.time() + timeout
-    while True:
+class RemoteBackend:
+    """An external server with an OpenAI-compatible /v1/audio/transcriptions endpoint
+    (asr_server.py --http, vLLM, speaches, whisper.cpp server, OpenAI, Groq, ...)."""
+    name = "remote"
+
+    def __init__(self, url, api_key=None, model=None):
+        url = url.rstrip("/")
+        if not url.endswith("/audio/transcriptions"):
+            url += "/audio/transcriptions" if url.endswith("/v1") else "/v1/audio/transcriptions"
+        self.url, self.api_key, self.model = url, api_key, model or "whisper-1"
+
+    def prepare(self):
+        pass
+
+    def transcribe(self, pcm, lang, timeout=120):
+        wav = io.BytesIO()
+        with wave.open(wav, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(RATE)
+            w.writeframes(pcm)
+        fields = {"model": self.model, "response_format": "json"}
+        if lang and lang != "auto":
+            fields["language"] = lang.split("-")[0].lower()  # the API takes ISO-639-1: sv-SE -> sv
+        boundary = uuid.uuid4().hex
+        body = b"".join(f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+                        for k, v in fields.items())
+        body += (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+                 f"Content-Type: audio/wav\r\n\r\n").encode() + wav.getvalue() + f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(self.url, data=body, method="POST",
+                                     headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        if self.api_key:
+            req.add_header("Authorization", f"Bearer {self.api_key}")
         try:
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.connect(SOCKET)
-            break
-        except (FileNotFoundError, ConnectionRefusedError):
-            s.close()
-            if time.time() > deadline:
-                raise RuntimeError("ASR server not reachable, see " + SERVER_LOG)
-            time.sleep(0.5)
-    with s:
-        s.sendall((json.dumps({"lang": lang, "rate": RATE, "nbytes": len(pcm)}) + "\n").encode() + pcm)
-        resp = json.loads(s.makefile("rb").readline())
-    if "error" in resp:
-        raise RuntimeError(resp["error"])
-    return resp["text"]
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                resp = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode(errors="replace").strip()
+            raise RuntimeError(f"remote ASR: HTTP {e.code} {detail[:200]}") from None
+        except (urllib.error.URLError, OSError) as e:
+            raise RuntimeError(f"remote ASR not reachable ({self.url}): {getattr(e, 'reason', e)}") from None
+        if "error" in resp:
+            raise RuntimeError(f"remote ASR: {resp['error']}")
+        return resp["text"].strip()
+
+
+# ---------------------------------------------------------------- configuration
+
+def load_config():
+    try:
+        with open(CONFIG, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        return {}
+    except tomllib.TOMLDecodeError as e:
+        sys.exit(f"vtype: invalid config {CONFIG}: {e}")
+
+
+def save_config(cfg):
+    def fmt(v):
+        return ("true" if v else "false") if isinstance(v, bool) else json.dumps(v, ensure_ascii=False)
+    lines = [f"{k} = {fmt(v)}" for k, v in cfg.items() if not isinstance(v, dict)]
+    for table, values in cfg.items():
+        if isinstance(values, dict) and values:
+            lines += ["", f"[{table}]"] + [f"{k} = {fmt(v)}" for k, v in values.items()]
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    fd = os.open(CONFIG, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # may hold an API key
+    with os.fdopen(fd, "w") as f:
+        f.write("# vtype configuration - edit by hand or run `vtype --configure`\n" + "\n".join(lines) + "\n")
+
+
+def configure():
+    cfg = load_config()
+    remote = dict(cfg.get("remote", {}))
+
+    def ask(prompt, default=""):
+        answer = input(f"{prompt}{f' [{default}]' if default else ''}: ").strip()
+        return answer or default
+
+    print("Where is the speech recognition model served?")
+    print("  1) local   on this machine (asr_server.py, started automatically)")
+    print("  2) remote  an external URL with an OpenAI-compatible /v1/audio/transcriptions endpoint")
+    choice = ask("Choice", "2" if cfg.get("backend") == "remote" else "1")
+    if choice in ("2", "remote"):
+        cfg["backend"] = "remote"
+        while not (url := ask("URL, e.g. https://asr.example.com/v1", remote.get("url", ""))):
+            pass
+        remote["url"] = url
+        key = getpass.getpass("API key (Enter to keep current, '-' for none): " if remote.get("api_key")
+                              else "API key (Enter for none): ").strip()
+        if key == "-":
+            remote.pop("api_key", None)
+        elif key:
+            remote["api_key"] = key
+        remote["model"] = ask("Model name", remote.get("model", "whisper-1"))
+        cfg["remote"] = remote
+    else:
+        cfg["backend"] = "local"
+    cfg["lang"] = ask("Default language (en-US, sv-SE, auto, ...)", cfg.get("lang", "en-US"))
+    save_config(cfg)
+    print(f"Wrote {CONFIG}. Try it with: vtype --test-mic")
+
+
+def make_backend(args, cfg):
+    remote = cfg.get("remote", {})
+    name = (args.backend or os.environ.get("VTYPE_BACKEND")
+            or ("remote" if args.url else None) or cfg.get("backend") or "local")
+    if name == "local":
+        return LocalBackend()
+    if name != "remote":
+        sys.exit(f"vtype: unknown backend {name!r} (use local or remote)")
+    url = args.url or os.environ.get("VTYPE_URL") or remote.get("url")
+    if not url:
+        sys.exit("vtype: remote backend needs a URL: run `vtype --configure`, set VTYPE_URL, or pass --url")
+    return RemoteBackend(url, os.environ.get("VTYPE_API_KEY") or remote.get("api_key"),
+                         args.model or os.environ.get("VTYPE_MODEL") or remote.get("model"))
 
 
 # ---------------------------------------------------------------- pty wrapper
@@ -142,20 +276,45 @@ def copy_winsize(master_fd):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Push-to-talk dictation wrapper")
-    ap.add_argument("--lang", default=os.environ.get("VTYPE_LANG", "en-US"),
-                    help="en-US, sv-SE, auto, ... (default en-US or $VTYPE_LANG)")
-    ap.add_argument("--key", default="f9", choices=KEYS, help="record toggle key (default f9)")
-    ap.add_argument("--lang-key", default="f10", choices=KEYS, help="language cycle key (default f10)")
-    ap.add_argument("--submit", action="store_true", help="press Enter after inserting text")
+    ap = argparse.ArgumentParser(description="Push-to-talk dictation wrapper",
+                                 epilog=f"Settings not given as options are read from {CONFIG}.")
+    ap.add_argument("--lang", help="en-US, sv-SE, auto, ... (default en-US)")
+    ap.add_argument("--key", choices=KEYS, help="record toggle key (default f9)")
+    ap.add_argument("--lang-key", choices=KEYS, help="language cycle key (default f10)")
+    ap.add_argument("--submit", action="store_true", default=None, help="press Enter after inserting text")
+    ap.add_argument("--backend", choices=["local", "remote"], help="where the model runs (default local)")
+    ap.add_argument("--url", help="remote server URL, e.g. https://asr.example.com/v1 (implies --backend remote)")
+    ap.add_argument("--model", help="model name sent to the remote server (default whisper-1)")
     ap.add_argument("command", nargs=argparse.REMAINDER, help="command to run (default: claude)")
     ap.add_argument("--test-mic", action="store_true", help="record 3 s, print the level and transcript")
+    ap.add_argument("--configure", action="store_true", help="choose local or remote backend and write the config")
     args = ap.parse_args()
     cmd = [c for c in args.command if c != "--"] or ["claude"]
 
+    if args.configure:
+        return configure()
+
+    # herdr identifies a pane's agent by its foreground process, which is vtype, not the wrapped
+    # command. HERDR_AGENT names the real agent; herdr reads it from /proc/<pid>/environ, so it
+    # has to be in vtype's startup environment - hence the re-exec.
+    if os.environ.get("HERDR_ENV") == "1" and "HERDR_AGENT" not in os.environ and not args.test_mic:
+        env = dict(os.environ, HERDR_AGENT=os.path.basename(cmd[0]))
+        os.execve(sys.executable, [sys.executable, os.path.realpath(__file__)] + sys.argv[1:], env)
+
+    cfg = load_config()
+    args.lang = args.lang or os.environ.get("VTYPE_LANG") or cfg.get("lang") or "en-US"
+    args.key = args.key or cfg.get("key") or "f9"
+    args.lang_key = args.lang_key or cfg.get("lang_key") or "f10"
+    args.submit = args.submit if args.submit is not None else bool(cfg.get("submit", False))
+    for opt in ("key", "lang_key"):
+        if getattr(args, opt) not in KEYS:
+            sys.exit(f"vtype: {opt} must be one of {', '.join(KEYS)}")
+    backend = make_backend(args, cfg)
+
     if args.test_mic:
-        ensure_server()
+        backend.prepare()
         rec = Recorder()
+        print(f"Backend: {backend.name}" + (f" ({backend.url}, model {backend.model})" if backend.name == "remote" else ""))
         print("Recording 3 s - say something...")
         rec.start()
         time.sleep(3)
@@ -164,10 +323,13 @@ def main():
             sys.exit(f"mic error: {rec.error}")
         peak = max(map(abs, array.array("h", pcm)), default=0)
         print(f"peak level: {peak / 327.68:.1f}%" + ("  <- silent: Windows isn't passing the mic to WSL" if peak < 300 else ""))
-        print("transcript:", repr(transcribe(pcm, args.lang)))
+        try:
+            print("transcript:", repr(backend.transcribe(pcm, args.lang)))
+        except RuntimeError as e:
+            sys.exit(f"error: {e}")
         return
 
-    ensure_server()
+    backend.prepare()
     rec = Recorder()
     rec_key, lang_key = KEYS[args.key], KEYS[args.lang_key]
     langs = LANGS if args.lang in LANGS else [args.lang] + LANGS
@@ -179,6 +341,7 @@ def main():
 
     pid, master = pty.fork()
     if pid == 0:
+        os.environ.pop("HERDR_AGENT", None)  # the hint is for vtype only, not the agent's children
         try:
             os.execvp(cmd[0], cmd)
         except OSError as e:
@@ -208,7 +371,7 @@ def main():
             return
         status("⏳ transcribing")
         try:
-            text = transcribe(pcm, lang)
+            text = backend.transcribe(pcm, lang)
         except Exception as e:
             status(f"⚠ vtype: {e}")
             return
