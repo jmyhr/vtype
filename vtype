@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""vtype - push-to-talk dictation for any terminal program (built for Claude Code).
+
+    vtype [--lang sv-SE] [--key f9] [--submit] [-- ] claude [args...]
+
+Runs the command in a pseudo-terminal. Press the hotkey (default F9) to start
+recording from the microphone; press it again to stop. The audio goes to the
+local Nemotron ASR server and the text is typed into the program's input.
+F10 cycles the language. Recording state is shown in the terminal tab title.
+
+Stdlib only: audio is captured from WSLg's PulseAudio server via libpulse-simple.
+"""
+import argparse
+import array
+import ctypes
+import fcntl
+import json
+import os
+import pty
+import select
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+SOCKET = os.path.expanduser("~/.cache/vtype/asr.sock")
+SERVER_LOG = os.path.expanduser("~/.cache/vtype/server.log")
+RATE = 16000
+
+KEYS = {
+    "f5": b"\x1b[15~", "f6": b"\x1b[17~", "f7": b"\x1b[18~", "f8": b"\x1b[19~",
+    "f9": b"\x1b[20~", "f10": b"\x1b[21~", "f11": b"\x1b[23~", "f12": b"\x1b[24~",
+    "ctrl-space": b"\x00",
+}
+LANGS = ["en-US", "sv-SE", "auto"]
+
+
+# ---------------------------------------------------------------- audio capture
+
+class PaSampleSpec(ctypes.Structure):
+    _fields_ = [("format", ctypes.c_int), ("rate", ctypes.c_uint32), ("channels", ctypes.c_uint8)]
+
+
+class Recorder:
+    PA_STREAM_RECORD = 2
+    PA_SAMPLE_S16LE = 3
+
+    def __init__(self):
+        self.lib = ctypes.CDLL("libpulse-simple.so.0")
+        self.lib.pa_simple_new.restype = ctypes.c_void_p
+        self.lib.pa_simple_new.argtypes = [
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_char_p,
+            ctypes.POINTER(PaSampleSpec), ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+        ]
+        self.lib.pa_simple_read.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_int)]
+        self.lib.pa_simple_free.argtypes = [ctypes.c_void_p]
+        self.recording = threading.Event()
+        self.frames = []
+        self.thread = None
+        self.error = None
+
+    def start(self):
+        self.frames = []
+        self.error = None
+        self.recording.set()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.recording.clear()
+        if self.thread:
+            self.thread.join()
+        return b"".join(self.frames)
+
+    def _run(self):
+        spec = PaSampleSpec(self.PA_SAMPLE_S16LE, RATE, 1)
+        err = ctypes.c_int(0)
+        s = self.lib.pa_simple_new(None, b"vtype", self.PA_STREAM_RECORD, None, b"dictation",
+                                   ctypes.byref(spec), None, None, ctypes.byref(err))
+        if not s:
+            self.error = f"pa_simple_new failed ({err.value})"
+            return
+        chunk = RATE // 20 * 2  # 50 ms of int16
+        buf = ctypes.create_string_buffer(chunk)
+        try:
+            while self.recording.is_set():
+                if self.lib.pa_simple_read(s, buf, chunk, ctypes.byref(err)) < 0:
+                    self.error = f"pa_simple_read failed ({err.value})"
+                    return
+                self.frames.append(buf.raw)
+        finally:
+            self.lib.pa_simple_free(s)
+
+
+# ---------------------------------------------------------------- ASR client
+
+def ensure_server():
+    if os.path.exists(SOCKET):
+        return
+    os.makedirs(os.path.dirname(SOCKET), exist_ok=True)
+    py = os.path.join(HERE, ".venv", "bin", "python")
+    with open(SERVER_LOG, "ab") as logf:
+        subprocess.Popen([py, os.path.join(HERE, "asr_server.py"), "--warmup"],
+                         stdin=subprocess.DEVNULL, stdout=logf, stderr=logf, start_new_session=True)
+
+
+def transcribe(pcm, lang, timeout=180):
+    deadline = time.time() + timeout
+    while True:
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect(SOCKET)
+            break
+        except (FileNotFoundError, ConnectionRefusedError):
+            s.close()
+            if time.time() > deadline:
+                raise RuntimeError("ASR server not reachable, see " + SERVER_LOG)
+            time.sleep(0.5)
+    with s:
+        s.sendall((json.dumps({"lang": lang, "rate": RATE, "nbytes": len(pcm)}) + "\n").encode() + pcm)
+        resp = json.loads(s.makefile("rb").readline())
+    if "error" in resp:
+        raise RuntimeError(resp["error"])
+    return resp["text"]
+
+
+# ---------------------------------------------------------------- pty wrapper
+
+def set_title(text):
+    os.write(sys.stdout.fileno(), f"\x1b]0;{text}\x07".encode())
+
+
+def copy_winsize(master_fd):
+    size = fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b"\0" * 8)
+    fcntl.ioctl(master_fd, termios.TIOCSWINSZ, size)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Push-to-talk dictation wrapper")
+    ap.add_argument("--lang", default=os.environ.get("VTYPE_LANG", "en-US"),
+                    help="en-US, sv-SE, auto, ... (default en-US or $VTYPE_LANG)")
+    ap.add_argument("--key", default="f9", choices=KEYS, help="record toggle key (default f9)")
+    ap.add_argument("--lang-key", default="f10", choices=KEYS, help="language cycle key (default f10)")
+    ap.add_argument("--submit", action="store_true", help="press Enter after inserting text")
+    ap.add_argument("command", nargs=argparse.REMAINDER, help="command to run (default: claude)")
+    ap.add_argument("--test-mic", action="store_true", help="record 3 s, print the level and transcript")
+    args = ap.parse_args()
+    cmd = [c for c in args.command if c != "--"] or ["claude"]
+
+    if args.test_mic:
+        ensure_server()
+        rec = Recorder()
+        print("Recording 3 s - say something...")
+        rec.start()
+        time.sleep(3)
+        pcm = rec.stop()
+        if rec.error:
+            sys.exit(f"mic error: {rec.error}")
+        peak = max(map(abs, array.array("h", pcm)), default=0)
+        print(f"peak level: {peak / 327.68:.1f}%" + ("  <- silent: Windows isn't passing the mic to WSL" if peak < 300 else ""))
+        print("transcript:", repr(transcribe(pcm, args.lang)))
+        return
+
+    ensure_server()
+    rec = Recorder()
+    rec_key, lang_key = KEYS[args.key], KEYS[args.lang_key]
+    langs = LANGS if args.lang in LANGS else [args.lang] + LANGS
+    state = {"lang": args.lang}
+
+    # read by statusline.sh, which Claude Code runs as a child and so inherits VTYPE_STATE
+    state_file = os.path.join(os.path.dirname(SOCKET), f"state-{os.getpid()}")
+    os.environ["VTYPE_STATE"] = state_file
+
+    pid, master = pty.fork()
+    if pid == 0:
+        try:
+            os.execvp(cmd[0], cmd)
+        except OSError as e:
+            print(f"vtype: cannot run {cmd[0]}: {e}", file=sys.stderr)
+            os._exit(127)
+
+    write_lock = threading.Lock()
+
+    def to_child(data):
+        with write_lock:
+            os.write(master, data)
+
+    def status(msg):
+        set_title(f"{msg} [{state['lang']}] {' '.join(cmd)}")
+        line = {"🎙 REC": "\x1b[1;37;41m ● REC \x1b[0m", "⏳ transcribing": "\x1b[33m⏳ transcribing…\x1b[0m"}.get(
+            msg, f"\x1b[2m🎙 {args.key.upper()} to talk\x1b[0m" if msg == "vtype" else f"\x1b[31m{msg}\x1b[0m")
+        with open(state_file, "w") as f:
+            f.write(f"{line} \x1b[2m{state['lang']}\x1b[0m\n")
+
+    def finish(pcm, lang):
+        if len(pcm) < RATE * 2 * 0.3:  # under 0.3 s: treat as an accidental tap
+            status("vtype")
+            return
+        samples = array.array("h", pcm)
+        if max(map(abs, samples)) < 300:  # ~1% of full scale: the mic delivered silence
+            status("⚠ mic is silent - check Windows mic privacy settings")
+            return
+        status("⏳ transcribing")
+        try:
+            text = transcribe(pcm, lang)
+        except Exception as e:
+            status(f"⚠ vtype: {e}")
+            return
+        if text:
+            to_child(text.encode() + (b"\r" if args.submit else b" "))
+        status("vtype")
+
+    old_attrs = termios.tcgetattr(sys.stdin.fileno())
+    tty.setraw(sys.stdin.fileno())
+    signal.signal(signal.SIGWINCH, lambda *_: copy_winsize(master))
+
+    def forward_and_exit(sig, _frame):  # e.g. terminal tab closed: pass it on, then clean up
+        os.kill(pid, sig)
+        raise SystemExit(128 + sig)
+
+    signal.signal(signal.SIGHUP, forward_and_exit)
+    signal.signal(signal.SIGTERM, forward_and_exit)
+    copy_winsize(master)
+    status("vtype")
+
+    try:
+        while True:
+            try:
+                ready, _, _ = select.select([sys.stdin, master], [], [])
+            except InterruptedError:
+                continue
+            if master in ready:
+                try:
+                    data = os.read(master, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                os.write(sys.stdout.fileno(), data)
+            if sys.stdin in ready:
+                data = os.read(sys.stdin.fileno(), 65536)
+                if not data:
+                    break
+                while rec_key in data:
+                    data = data.replace(rec_key, b"", 1)
+                    if rec.recording.is_set():
+                        pcm = rec.stop()
+                        if rec.error:
+                            status(f"⚠ mic: {rec.error}")
+                        else:
+                            threading.Thread(target=finish, args=(pcm, state["lang"]), daemon=True).start()
+                    else:
+                        rec.start()
+                        status("🎙 REC")
+                while lang_key in data:
+                    data = data.replace(lang_key, b"", 1)
+                    state["lang"] = langs[(langs.index(state["lang"]) + 1) % len(langs)]
+                    status("🎙 REC" if rec.recording.is_set() else "vtype")
+                if data:
+                    to_child(data)
+    finally:
+        try:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSAFLUSH, old_attrs)
+        except termios.error:  # terminal already gone
+            pass
+        if rec.recording.is_set():
+            rec.stop()
+        try:
+            os.unlink(state_file)
+        except FileNotFoundError:
+            pass
+        _, status_code = os.waitpid(pid, 0)
+    sys.exit(os.waitstatus_to_exitcode(status_code))
+
+
+if __name__ == "__main__":
+    main()
