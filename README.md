@@ -255,3 +255,7 @@ pressing F9 and pause briefly before stopping. Compare with the saved recordings
 | [KBLab/kb-whisper-large](https://huggingface.co/KBLab/kb-whisper-large) | Swedish | Apache-2.0 |
 
 The models are downloaded from Hugging Face on first use and aren't part of this repository.
+
+## License
+
+vtype is released under the [MIT License](LICENSE). The models above keep their own licenses.
