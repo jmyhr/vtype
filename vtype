@@ -261,7 +261,7 @@ def make_backend(args, cfg):
     if not url:
         sys.exit("vtype: remote backend needs a URL: run `vtype --configure`, set VTYPE_URL, or pass --url")
     return RemoteBackend(url, os.environ.get("VTYPE_API_KEY") or remote.get("api_key"),
-                         args.model or os.environ.get("VTYPE_MODEL") or remote.get("model"))
+                         args.asr_model or os.environ.get("VTYPE_MODEL") or remote.get("model"))
 
 
 # ---------------------------------------------------------------- pty wrapper
@@ -284,12 +284,23 @@ def main():
     ap.add_argument("--submit", action="store_true", default=None, help="press Enter after inserting text")
     ap.add_argument("--backend", choices=["local", "remote"], help="where the model runs (default local)")
     ap.add_argument("--url", help="remote server URL, e.g. https://asr.example.com/v1 (implies --backend remote)")
-    ap.add_argument("--model", help="model name sent to the remote server (default whisper-1)")
+    ap.add_argument("--asr-model", help="model name sent to the remote server (default whisper-1)")
     ap.add_argument("command", nargs=argparse.REMAINDER, help="command to run (default: claude)")
     ap.add_argument("--test-mic", action="store_true", help="record 3 s, print the level and transcript")
     ap.add_argument("--configure", action="store_true", help="choose local or remote backend and write the config")
-    args = ap.parse_args()
-    cmd = [c for c in args.command if c != "--"] or ["claude"]
+    # vtype's own options come first; everything from the first unknown argument on belongs to the
+    # wrapped command, so `vtype --resume ID` (e.g. via `alias claude=vtype`) runs `claude --resume ID`
+    argv, own = sys.argv[1:], []
+    while argv and argv[0] != "--":
+        action = ap._option_string_actions.get(argv[0].split("=", 1)[0])
+        if action is None:
+            break
+        n = 1 if action.nargs == 0 or "=" in argv[0] else 2
+        own, argv = own + argv[:n], argv[n:]
+    args = ap.parse_args(own)
+    cmd = argv[1:] if argv[:1] == ["--"] else argv
+    if not cmd or cmd[0].startswith("-"):
+        cmd = ["claude"] + cmd
 
     if args.configure:
         return configure()

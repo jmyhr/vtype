@@ -110,7 +110,7 @@ If you already have a status line, call `statusline.sh` from it and append its o
 ```bash
 vtype                       # runs `claude`
 vtype --lang sv-SE          # start in Swedish
-vtype -- claude --resume    # pass arguments to claude
+vtype --resume ID           # unknown flags go to claude: runs `claude --resume ID`
 vtype -- bash               # works with any terminal program
 ```
 
@@ -143,7 +143,7 @@ The same state is also written to the terminal tab title.
 | `--submit` | off | Press Enter after inserting text |
 | `--backend` | `local` | `local` or `remote` |
 | `--url` | | Remote server URL; implies `--backend remote` |
-| `--model` | `whisper-1` | Model name sent to the remote server |
+| `--asr-model` | `whisper-1` | Model name sent to the remote server |
 | `--test-mic` | | Record 3 s, print the backend, level and transcript, exit |
 | `--configure` | | Choose local or remote interactively and write the config file |
 
