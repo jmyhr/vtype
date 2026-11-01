@@ -1,3 +1,6 @@
+<img width="519" height="263" alt="image" src="https://github.com/user-attachments/assets/023c445c-6a8b-4a8c-9f64-2ba406cc08c7" />
+<img width="525" height="266" alt="image" src="https://github.com/user-attachments/assets/e59ff19a-464f-4de9-a688-a867f5c45645" />
+
 # vtype
 
 Push-to-talk dictation for [Claude Code](https://claude.com/claude-code) (or any terminal program),
